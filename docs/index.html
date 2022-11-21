@@ -1,0 +1,354 @@
+<!doctype html>
+<html>
+
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+	<title>Blue Skies, Green Builds </title>
+
+	<link rel="stylesheet" href="dist/reset.css">
+	<link rel="stylesheet" href="dist/reveal.css">
+	<link rel="stylesheet" href="dist/theme/black.css">
+
+	<!-- Theme used for syntax highlighted code -->
+	<link rel="stylesheet" href="plugin/highlight/monokai.css">
+</head>
+
+<body>
+	<div class="reveal">
+		<div class="slides">
+
+			<!-- Slides are separated by three dashes (the default) -->
+			<section data-markdown data-separator="^\n---\n$" data-separator-vertical="^\n--\n$" data-separator-notes="Note:$">
+				# Release Orchestration 
+				### for Fun and Profit
+
+				A brief intro to Vamp's current capabilities.
+			
+				Note:
+				Here is speaker notes
+				
+			</section>
+
+			<!-- Slides are separated by regexp matching newline + three dashes + newline, vertical slides identical but two dashes -->
+			<section data-markdown data-separator="^\n---\n$" data-separator-vertical="^\n--\n$" data-separator-notes="Note:$">
+				## The story
+
+				- A basic web-service is built, tested, and deployed to users.
+				
+				- The service is one of many dozens or hundreds of microservices working in cooperation (think netflix)
+				
+				- A single team owns only a handful of services.
+				
+				(Modern teams using cloud native architecture on k8s platform)
+
+				![netflix UI mocked up wiot potential service boundaries](assets/netflix.png)
+				
+				--
+
+				## Traditional CCI Story
+				- Developer commits code
+				- Fix breaking change in unit - fast feedback, optmizations
+				- Concurrent packaging of docker while IT tests run
+				- Deploy versioned image to docker hub
+				- Apply deployment to K8s cluster. 
+
+				![circleci workflow with build, package, apply workflow](assets/cci_workflow.png)
+
+				--
+
+				### But ah Snap!
+				
+				The service selector in the manifest was bogus, and our beautiful little container is shutoff from the world.
+
+				Users are getting angry error pages!
+
+				![githubs 503 unicorn](assets/gh_angry.png)
+
+				--
+
+				### Adding Release Monitoring 
+				- Release agent detects deployment by CCI, Argo, or sun gods (by matching labels [app, version])
+				- Release agent monitors metrics from prometheus based on defined metric queries
+				- At end of policy time-limit determine if thresholds were met and moves forward, or fails deployment
+				- Webhook is fired with details
+				- Admins get paged and fix stuff.
+
+				![alerts and metrics image](assets/alerts.png)
+
+				
+
+				--
+
+				### Adding Traffic Shaping
+				- Release agent also applies new ingress policy controlling traffic (10% canacy, 90% stable)
+				- Vamp agent monitors metrics from prometheus based on defined metric queries
+				- At end of policy Vamp determines if thresholds were met and increases rollout, or fails the `release`
+				- Webhook is fired with details
+
+
+				![alerts and metrics image](assets/canary.png)
+
+
+
+				--
+
+				### So What?
+				- If the application restarts too much  OR
+				- Does not respond in time OR
+				- Throws too many errors while it does OR
+				- X OR X OR x
+
+				Then reset ingress to "Stable" version, and fire webhooks
+
+				- operators don't get pages
+				- only a few customers ever notice
+				- dev team can keep iterating
+
+				--
+
+				## Webhooks, WHY DO WE NEED EM?
+				- Vamp handles ingress & scale based on policies that shape ingress, 
+				- but leaves the deployment itself out there (unrouted)
+				- Webhooks on Success to:
+					- approve CCI apporval job
+					- trigger parametized pipeline
+				- On failure:
+					- call CCI to cleanup bad deployment. 
+
+				--
+
+				## Recap
+
+				- Traditional approach was "hope our non-prod testing was adequate"
+					- A _passing_ pipeline in CircleCI is not the same as a _healthy_ application in the wild
+						- Invalid config, inadequate scale, integration issues, etc.
+
+				- Modern approach "Ensure our non-prod testing was adequate"
+					- We separate `deploy/publish` from `release`
+					- We can incrementally expose or rollback new versions
+				
+				--
+				
+				![tired, wired, inspired meme with CI,CD and RO](assets/releasethinking.jpeg)
+
+			</section>
+			<section data-markdown data-separator="^\n---\n$" data-separator-vertical="^\n--\n$" data-separator-notes="Note:$">
+				<script type="text/template">
+					<!-- .slide: data-background-image="assets/dogs.jpeg" style="color:white;text-shadow: 0 0 8px #000;" -->
+					## The Tech
+
+					Java app, in a container, on a cluster ( at night.)<!-- .element: style="color:white;text-shadow: 1 1 3px #000;" -->
+
+					- Java web app with Spring Boot, JDK 17, built with Maven 3.x<!-- .element: style="color:white;text-shadow: 1 1 3px #000;" -->
+					- Dockerized with Google Jib (daemonless)<!-- .element: style="color:white;text-shadow: 1 1 3px #000;" -->
+					- Deployed to k8s cluster in AWS EKS<!-- .element: style="color:white;text-shadow: 1 1 3px #000;" -->
+					- With a non-admin K8s Service Account<!-- .element: style="color:white;text-shadow: 1 1 3px #000;" -->
+					- Cluster using Contour ingress and Prometheus Monitoring<!-- .element: style="color:white;text-shadow: 1 1 3px #000;" -->
+
+
+					--
+
+					## Jib - Container Images for Java Apps
+					
+					Build OCI images without docker Daemon.  
+					Maven and Gradle plugins integrate to existing tool stack.
+
+					```yaml [7|8|9-13]
+					package-docker:
+						docker:
+						- image: cimg/openjdk:17.0-browsers
+						- run:
+							name: Package Docker image with Jib
+							command: |
+								./mvnw compile jib:build \
+								-B -DskipTests=true \
+								-Dbuild.number=<<pipeline.number>> \
+								-Dcommit.hash=${CIRCLE_SHA1} \
+								-Dcircle.workflow.guid=${CIRCLE_WORKFLOW_ID} \
+								-Dbuild.user=${CIRCLE_PROJECT_USERNAME} \
+								-Dbuild.repo=${CIRCLE_PROJECT_REPONAME} 
+					```
+
+					--
+
+					## Build Info (with Maven)
+					
+					We capture environment info and pass it to maven at build time. We can expose this later from our running container!
+
+					```xml [3,10-14]
+					<configuration>
+						<to>
+							<image>registry.hub.docker.com/eddiewebb/blueskygreenbuilds-demo:b${build.number}</image>
+						</to>
+						<from>
+							<image>openjdk:17-alpine</image>
+						</from>
+						<container>
+							<jvmFlags>
+								<jvmFlag>-Dbuild.number=${build.number}</jvmFlag>
+								<jvmFlag>-Dcommit.hash=${commit.hash}</jvmFlag>
+								<jvmFlag>-Dbuild.user=${build.user}</jvmFlag>
+								<jvmFlag>-Dbuild.repo=${build.repo}</jvmFlag>
+								<jvmFlag>-Dcircle.workflow.guid=${circle.workflow.guid}</jvmFlag>
+							</jvmFlags>
+						</container>
+					```
+					
+					--
+
+					## K8s cluster on EKS
+
+					- Using ELB domain pointing to cluster
+					- Contour handles ELB connections, routing to right service
+					- CircleCI uses a Service Account to access the cluster 
+
+					```bash [2-4|1|6|5|7-8|9]
+					echo ${SERVER_CERT_CA} | base64 -d > ca.crt
+					kubectl config set-cluster se-demo-eks-VlSWt4Kt \
+					  --server=https://k8s-api-host.tld \
+					  --certificate-authority=ca.crt
+					export DECODED_TOKEN=$(echo ${SE_DEMO_CLUSTER_CCI_USER_TOKEN} | base64 -d)
+					kubectl config set-credentials eddies-bot --token=${DECODED_TOKEN}
+					kubectl config set-context cci --user=eddies-bot --namespace=eddie --cluster=se-demo-eks-VlSWt4Kt
+					kubectl config use-context cci
+					# see vamp/make-service-account.sh
+					```
+
+				</script>
+			</section>
+			<section data-markdown data-separator="^\n---\n$" data-separator-vertical="^\n--\n$">
+				# Vamp Deep Dive
+
+				Walkthrough the Vamp agent, applications, policies, etc
+
+				--
+
+				## Vamp Release agent
+
+				Firstly, there is not direct trigger or API call to vamp. 
+				
+				With the Vamp release agent we essentially hand ingress control to Vamp.  The cluster installed binary communicates with Vamp Cloud to shape traffic based on detected deployments.
+
+				![visual of vamp agent on network](assets/vampoverview.png)
+
+				--
+
+				## Vamp - Application
+
+				An *Application* represents the tuple of (Cluster, Namespace, Ingress) 
+
+				You may think of Application as more of a Platform - it is not a specific web-service, UI, or function, but rather everything available behind a single domain.
+
+				[BlueSKyGreenBuild App in Vamp](https://vamp.cloud/6/application/211/0)
+
+				--
+
+				## Vamp - Services
+
+				A *Service* reprsents an individual web service or application running as a deployment, responsing on a specific path, and many may live in an Application
+
+				https://vamp.cloud/6/application/211/0/services
+
+				--
+
+				## Vamp - Policies & Metrics
+
+				Metrics are queries against prometheus essnetially.
+
+				Policies are which metrics (beyond required health & availability) are used over a fixed time or request volume to assess validity of change.
+				- 90% of responses < 500ms
+				- 1,000 requests/min of traffic
+				- No more than 2 restarts
+
+				https://vamp.cloud/6/policy/66/steps
+
+			</section>
+			<section data-markdown data-separator="^\n---\n$" data-separator-vertical="^\n--\n$">
+				<script type="text/template">
+					## The Toys (Demo sugar)
+
+					To demonstrate the load balancing, metrics and other attributes, the sample app & cluster have some demo candy.
+
+					--
+
+					- [custom domain](http://blueskygreenbuilds.com) routes to AWS ELB
+					- Exposing custom metrics @ [`/actuator`](http://blueskygreenbuilds.com/actuator) including JMX, traces and prometheus summary
+					- Exposing build & pod info on a [`/build-info`](http://blueskygreenbuilds.com/build-info) endpoint
+					- Webhooks in Vamp trigger conditional cleanup workflow in CCI
+					- Contour exposes a .png of routing 
+					- We can browse prometheus from local using port tunneling
+
+					--
+
+					### Build info
+
+					Talk to governance, traceability, debuggability and fun with load balancers.  Each running instance exposes version and instance info.
+
+					![json output showing version, IP, workflow ID and commit hash](assets/buildinfo.png)
+					
+					--
+
+					### Load balancers?!
+					Well, ingress controllers technically, but yeah!
+
+					The config your define in Vamp configures the Contour ingress controller behind your domain. 
+					This means during deployment we can see the version (buildnum) bounce back and forth as we reload.
+
+					![dag of Contour ingress paths](assets/contouringress.png)
+
+				</script>
+			</section>
+
+			<section data-markdown data-separator="^\n---\n$" data-separator-vertical="^\n--\n$">
+				# Cool Let's Play
+
+
+				https://app.circleci.com/pipelines/github/eddiewebb/demo-blueskygreenbuilds?branch=main
+
+
+
+			</section>
+
+			<section data-markdown data-separator="^\n---\n$" data-separator-vertical="^\n--\n$">
+				# Fin
+			</section>
+
+		</div>
+	</div>
+
+	<script src="dist/reveal.js"></script>
+	<script src="plugin/notes/notes.js"></script>
+	<script src="plugin/markdown/markdown.js"></script>
+	<script src="plugin/highlight/highlight.js"></script>
+	<script>
+		// More info about initialization & config:
+		// - https://revealjs.com/initialization/
+		// - https://revealjs.com/config/
+		Reveal.initialize({
+			hash: true,
+
+			// Learn about plugins: https://revealjs.com/plugins/
+			plugins: [RevealMarkdown, RevealHighlight, RevealNotes],
+
+			// The "normal" size of the presentation, aspect ratio will
+			// be preserved when the presentation is scaled to fit different
+			// resolutions. Can be specified using percentage units.
+			width: "100%",
+			height: "100%",
+
+			// Factor of the display size that should remain empty around
+			// the content
+			margin: 0.04,
+
+			// Bounds for smallest/largest possible scale to apply to content
+			//minScale: 0.1,
+			//maxScale: 1.0,
+
+			center: false
+		});
+	</script>
+</body>
+
+</html>

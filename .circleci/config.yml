@@ -1,0 +1,366 @@
+version: 2.1
+
+parameters:
+  cleanup:
+    type: boolean
+    default: false
+    description: Should this run cleanup an old deploy?
+  version:
+    type: string
+    default: ""
+    description: the version (latest or prior) to be deleted
+  job_name:
+    type: string
+    default: delete deployment
+
+
+orbs:
+  continuation: circleci/continuation@0.2.0
+  kubernetes:   circleci/kubernetes@0.12.0
+  kubectl-config: ryanpedersen/kubectl-config@0.1.0
+  saucelabs:    saucelabs/sauce-connect@1.0.1
+  maven:        circleci/maven@0.0.4
+  build-auditor:
+    jobs:
+      check_context_usage:
+        parameters:
+          production-branch: 
+            default: main
+            description: The name of the production branch. Usually main or master.
+            type: string
+          production-context-keyword:
+            default: production
+            description: any context containing this string will be consisder production
+            type: string
+          scan-period:
+            default: 24
+            type: integer
+            description: number of hours to scan history. NOT IMPLEMENTED
+          project-token-var-name:
+            default: CIRCLECI_API_KEY
+            description: The local variable name for a READ ONLY project project-token
+            type: env_var_name
+        docker:
+            - image: cimg/base:stable
+        steps:
+          - run:
+              name: load previsou period build summaries
+              command: |
+                mkdir reports
+                # get all rcent builds
+                curl -H "Circle-Token: ${<< parameters.project-token-var-name >>}" "https://circleci.com/api/v1.1/recent-builds" > recent-builds.json
+                # fitler to key info
+                jq '[.[] | {build_url,branch,context_ids, user_login: .user.login, user_full_name: .user.name, user_email: .committer_email, job_id: .workflows.job_id}]' recent-builds.json > reports/summary.json
+                # find violations using prodcution cotnext not on producuton branhc
+                # could be json, csv, etc.
+                jq '[.[] | select(.context_ids[] | match("<< parameters.production-context-keyword >>";"i")) |  select(.branch != "<< parameters.production-branch >>")]' reports/summary.json > reports/violations.json
+          - store_artifacts:
+              path: reports
+          - run:
+              name: Fail build if violations found.
+              command: |
+                VIOLATIONS=`jq '. | length' reports/violations.json`
+                if [[ $VIOLATIONS != 0 ]]; then
+                  echo "${VIOLATIONS} Context access violatinos found. Please see reports/violations.json"
+                  exit 1
+                fi
+          ## optinoall call slack orb, webhooks, etc.
+
+workflows:
+  version: 2
+
+  #default workflow runs on pushes.
+  build_deploy:
+    unless: << pipeline.parameters.cleanup >>
+    jobs:
+      - unit-test:
+          context: Production-Only  #we'll see this is caught by nightly auditor as invalid.
+      - sum-coverage:
+          requires:
+            - unit-test
+      - package-jar:
+          requires:
+            - unit-test
+          filters:
+            branches:
+              only: main
+      - package-docker:
+          requires:
+            - unit-test
+          filters:
+            branches:
+              only: main
+      - update-deployment:
+          requires:
+            - package-docker
+          filters:
+            branches:
+              only: main
+  vamp:
+    when: << pipeline.parameters.cleanup >>
+    jobs:
+      - delete-deployment:
+          name: << pipeline.parameters.job_name >>
+
+jobs:
+  unit-test:
+    docker:
+      - image: cimg/openjdk:17.0-browsers
+    parallelism: 2
+    steps:
+      - checkout
+      - run:
+          name: Enable Test Splitting
+          command: |
+            mkdir -p .circleci/tests/
+
+            # generate excluded surefire tests using provided pattern
+            circleci tests glob src/test/java/**/*Test*.java | \
+              sed -e 's#^src/test/java/\(.*\)\.java#\1#' | \
+              tr "/" "." > .circleci/tests/surefire_classnames
+            cat .circleci/tests/surefire_classnames | \
+              circleci tests split --split-by=timings --timings-type=classname > /tmp/this_node_tests
+            cat .circleci/tests/surefire_classnames | \
+              grep -xvf /tmp/this_node_tests > .circleci/tests/surefire_classnames_ignore_list
+      - store_artifacts:
+          path: .circleci/tests/
+      - maven/with_cache:
+          steps:
+            - run:
+                name: Run Tests
+                command: mvn test -B -Dsurefire.excludesFile=.circleci/tests/surefire_classnames_ignore_list 
+      - maven/process_test_results:
+          test_results_path: target/surefire-reports
+      - run:
+          name: Collect Code Cov
+          command: |
+            curl -L https://codeclimate.com/downloads/test-reporter/test-reporter-latest-linux-amd64 > ./cc-test-reporter
+            chmod +x ./cc-test-reporter
+            ./mvnw jacoco:report #convert binary jacoco.exec to XML in target/site/jacoco
+            export JACOCO_SOURCE_PATH="src/main/java"
+            ./cc-test-reporter format-coverage -t jacoco  target/site/jacoco/jacoco.xml -o "coverage/codeclimate.$CIRCLE_NODE_INDEX.json"
+      - persist_to_workspace:
+          root: coverage
+          paths:
+            - codeclimate.*.json
+    
+  sum-coverage:
+    docker:
+      - image: circleci/node:10
+        environment:
+          PARTS: 2
+    working_directory: ~/repo
+    steps:
+      - attach_workspace:
+          at: coverage
+      - run:
+          name: Aggregate Code Coverage
+          command: |
+            curl -L https://codeclimate.com/downloads/test-reporter/test-reporter-latest-linux-amd64 > ./cc-test-reporter
+            chmod +x ./cc-test-reporter
+            ./cc-test-reporter sum-coverage --output - --parts $PARTS coverage/codeclimate.*.json | ./cc-test-reporter upload-coverage --debug --input -
+     
+  package-jar:
+    docker:
+      - image: cimg/openjdk:17.0-browsers
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - maven/with_cache:
+          steps: 
+            - run: |
+                ./mvnw package -B -DskipTests=true \
+                  -Dbuild.number=<<pipeline.number>> \
+                  -Dcommit.hash=${CIRCLE_SHA1} \
+                  -Dcircle.workflow.guid=${CIRCLE_WORKFLOW_ID} \
+                  -Dbuild.user=${CIRCLE_PROJECT_USERNAME} \
+                  -Dbuild.repo=${CIRCLE_PROJECT_REPONAME} 
+      - run:
+          name: Copy deployment artifacts to workspace
+          command: |
+            cp target/blueskygreenbuilds-*.jar /tmp/standalone-app.jar
+            cp src/main/resources/deployment/cf-manifest.yml /tmp/
+      - store_artifacts:
+          path: /tmp/standalone-app.jar
+      - store_artifacts:
+          path: /tmp/cf-manifest.yml
+      - persist_to_workspace:
+          root: /tmp
+          paths:
+            - standalone-app.jar
+            - cf-manifest.yml
+
+  package-docker:
+    docker:
+      - image: cimg/openjdk:17.0-browsers
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - blueskygreenbuilds-mvn-V2-{{ checksum "pom.xml" }}
+            - blueskygreenbuilds-mvn-V2
+      - run: ./mvnw dependency:go-offline
+      - run: cp .mvn/wrapper/settings.xml ~/.m2/settings.xml
+      - run: echo "<settingsSecurity><master>${maven_security_master}</master></settingsSecurity>" > ~/.m2/settings-security.xml
+      - run:
+          name: Package Docker image with Jib
+          command: |
+            ./mvnw compile jib:build -B -DskipTests=true \
+              -Dbuild.number=<<pipeline.number>> \
+              -Dcommit.hash=${CIRCLE_SHA1} \
+              -Dcircle.workflow.guid=${CIRCLE_WORKFLOW_ID} \
+              -Dbuild.user=${CIRCLE_PROJECT_USERNAME} \
+              -Dbuild.repo=${CIRCLE_PROJECT_REPONAME} 
+  
+  update-deployment:
+    environment:
+      SE_DEMO_CLUSTER_CCI_CERT: "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUM1ekNDQWMrZ0F3SUJBZ0lCQURBTkJna3Foa2lHOXcwQkFRc0ZBREFWTVJNd0VRWURWUVFERXdwcmRXSmwKY201bGRHVnpNQjRYRFRJeE1UQXlOakUxTlRjd04xb1hEVE14TVRBeU5ERTFOVGN3TjFvd0ZURVRNQkVHQTFVRQpBeE1LYTNWaVpYSnVaWFJsY3pDQ0FTSXdEUVlKS29aSWh2Y05BUUVCQlFBRGdnRVBBRENDQVFvQ2dnRUJBTG5CCkQzckt1OEZoa1dLZE5RZERBRFJ3TjRhMXFUR3lBWHNkTHlXSkdKaUk1SmpSZWVvcVFLWWRRdXRyelVPNms0cjgKMy9rRFVGM1lHcjVCMlZJeUQ2eXdVc2tjL3RSK0FmbHBmSTRPZS9NdGNkdUt4VUtYUU85ZHVTMzdUN2JpeUs3bgozOE9EaWh0aEJxQ0JUL3lyK3hKRGVvNXlyM2ZkbGFvQUljNlhGam9EblUvQ0lac1NyS2VVWHVmU3NkMXJaRUpUCm82aWFnejJRdjFZVTZFcjZob0d3ZnRMa004RENWVlRZMlR1cUE1VlZKY29JK0FoNnRaOXIvcjVnWDBvZHd6QW8KWEN5VlJraWZVK3NrU3JIc1huWlVFK2FhZ0FUdWtPQzdWQVNqNFJySUcySUY3dlphTTJ6SFkzSHU4NWFrWWliSQpUME5MQVR2aDk2Ri9zeEZQYVYwQ0F3RUFBYU5DTUVBd0RnWURWUjBQQVFIL0JBUURBZ0trTUE4R0ExVWRFd0VCCi93UUZNQU1CQWY4d0hRWURWUjBPQkJZRUZLU2tRN2hkcEVlNVNyVFBoM1dpNVV6bTRrZy9NQTBHQ1NxR1NJYjMKRFFFQkN3VUFBNElCQVFBeDF5a3RCQWMxMUlEdUMyaUlXRFFObUttUUw5L1orSlcwM3NYUTBxa042YUplZnBtRQpBeFZTaUJKMUswdEFPMGQxV0c5M2VWOVJlNzZzOXpzSkxadEgwRVdoSTVLVFhublgySlpja1o0SW5LRVBCRHB2Cm1uSzNGQmo2VGVOclY2Q2dzckYyM0ZzRm9MRUdSZTk1OURQbksvajJIMytVdk4xdHI3TUl4V3pISm1wVHF4Ni8KVHhUcS9pd3hKUXFKMXJlME9admxLcEZaTlNheVBsUm9GMXlzVXFuaU9jMlp3TjhDdzNOS2JFT0EwVlIwVFk1ego2Mk9TaUFWU1BueFFBczJnUDVOQTl0bXFnL2RSdTZDNmx2aVNjVk1UTU9UVnV4dTVSK0dFQ0hqcjlNQm1BdjVnCjBQcVV3L0FZQ3dhcGJuQXdyT2o3bldhMTlHS0NxZGlGd1hXegotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg=="
+      CA_CERT: "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUM1ekNDQWMrZ0F3SUJBZ0lCQURBTkJna3Foa2lHOXcwQkFRc0ZBREFWTVJNd0VRWURWUVFERXdwcmRXSmwKY201bGRHVnpNQjRYRFRJeE1UQXlOakUxTlRjd04xb1hEVE14TVRBeU5ERTFOVGN3TjFvd0ZURVRNQkVHQTFVRQpBeE1LYTNWaVpYSnVaWFJsY3pDQ0FTSXdEUVlKS29aSWh2Y05BUUVCQlFBRGdnRVBBRENDQVFvQ2dnRUJBTG5CCkQzckt1OEZoa1dLZE5RZERBRFJ3TjRhMXFUR3lBWHNkTHlXSkdKaUk1SmpSZWVvcVFLWWRRdXRyelVPNms0cjgKMy9rRFVGM1lHcjVCMlZJeUQ2eXdVc2tjL3RSK0FmbHBmSTRPZS9NdGNkdUt4VUtYUU85ZHVTMzdUN2JpeUs3bgozOE9EaWh0aEJxQ0JUL3lyK3hKRGVvNXlyM2ZkbGFvQUljNlhGam9EblUvQ0lac1NyS2VVWHVmU3NkMXJaRUpUCm82aWFnejJRdjFZVTZFcjZob0d3ZnRMa004RENWVlRZMlR1cUE1VlZKY29JK0FoNnRaOXIvcjVnWDBvZHd6QW8KWEN5VlJraWZVK3NrU3JIc1huWlVFK2FhZ0FUdWtPQzdWQVNqNFJySUcySUY3dlphTTJ6SFkzSHU4NWFrWWliSQpUME5MQVR2aDk2Ri9zeEZQYVYwQ0F3RUFBYU5DTUVBd0RnWURWUjBQQVFIL0JBUURBZ0trTUE4R0ExVWRFd0VCCi93UUZNQU1CQWY4d0hRWURWUjBPQkJZRUZLU2tRN2hkcEVlNVNyVFBoM1dpNVV6bTRrZy9NQTBHQ1NxR1NJYjMKRFFFQkN3VUFBNElCQVFBeDF5a3RCQWMxMUlEdUMyaUlXRFFObUttUUw5L1orSlcwM3NYUTBxa042YUplZnBtRQpBeFZTaUJKMUswdEFPMGQxV0c5M2VWOVJlNzZzOXpzSkxadEgwRVdoSTVLVFhublgySlpja1o0SW5LRVBCRHB2Cm1uSzNGQmo2VGVOclY2Q2dzckYyM0ZzRm9MRUdSZTk1OURQbksvajJIMytVdk4xdHI3TUl4V3pISm1wVHF4Ni8KVHhUcS9pd3hKUXFKMXJlME9admxLcEZaTlNheVBsUm9GMXlzVXFuaU9jMlp3TjhDdzNOS2JFT0EwVlIwVFk1ego2Mk9TaUFWU1BueFFBczJnUDVOQTl0bXFnL2RSdTZDNmx2aVNjVk1UTU9UVnV4dTVSK0dFQ0hqcjlNQm1BdjVnCjBQcVV3L0FZQ3dhcGJuQXdyT2o3bldhMTlHS0NxZGlGd1hXegotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg=="
+      SE_DEMO_CLUSTER_CCI_URL: "https://0DF7EA1E2D47EA3057B39C107F4DEADF.gr7.us-east-2.eks.amazonaws.com"
+    docker: 
+      - image: cimg/base:edge-18.04
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - run: echo "Using URL ${SE_DEMO_CLUSTER_CCI_URL}"
+      - run: echo "Using Cert ${CA_CERT}"
+      - run: sudo apt-get update && sudo apt-get install gettext-base graphviz
+      - run: 
+          name: Update image & version in manifest
+          command: |
+            export FINAL_VERSION=1.0.<<pipeline.number>> #vamp wants semantic version
+            export FINAL_IMAGE=eddiewebb/blueskygreenbuilds-demo:b<<pipeline.number>>
+            export CIRCLE_PIPELINE_NUM=<<pipeline.number>>
+            envsubst < src/main/resources/deployment/k8s-manifest.yaml > modified-deployment.yaml
+            cat modified-deployment.yaml
+      - kubernetes/install-kubectl
+      - config:
+          cluster_name: se-demo-eks-VlSWt4Kt
+          namespace: eddie
+          user_name: eddies_bot
+          token: SE_DEMO_CLUSTER_CCI_USER_TOKEN
+          cert: SE_DEMO_CLUSTER_CCI_CERT
+          server_endpoint: SE_DEMO_CLUSTER_CCI_URL
+      - kubernetes/create-or-update-resource:
+          namespace: eddie
+          resource-file-path: modified-deployment.yaml
+          #Copy pasta gross
+          #get-rollout-status: true
+          #resource-name: "deployment/blueskygreenbuilds-1.0.<<pipeline.number>>"
+      - run: kubectl rollout status -f modified-deployment.yaml
+      - run:
+          name: Capture Contour routes as DAG
+          command: |
+            sleep 10 
+            # let release agent catch deploy, tell contour to shape traffic. 
+            # must be a smarter way
+            vamp/get-dag-as-dot.sh
+            cat contour-dag.dot
+      - store_artifacts:
+          path: contour-dag.png
+      #- run:
+      #    name: mock continuation config
+      #    command: |
+      #      cat .circleci/config.yml | sed 's/setup: true/setup: false/' > gogo.yml
+      #- continuation/continue:
+      #    configuration_path: gogo.yml
+      #    parameters: '{"cleanup":true, "version":"1.0.<<pipeline.number>>", "job_name":"Rollback FAILED release 1.0.<<pipeline.number>>"}'
+
+
+  delete-deployment:
+    docker: 
+      - image: cimg/base:edge-18.04
+    working_directory: ~/repo
+    steps:
+      - checkout
+      - run: sudo apt-get update && sudo apt-get install graphviz
+      - kubernetes/install-kubectl
+      - config:
+          cluster_name: se-demo-eks-VlSWt4Kt
+          namespace: eddie
+          user_name: eddies_bot
+          token: SE_DEMO_CLUSTER_CCI_USER_TOKEN
+          cert: SE_DEMO_CLUSTER_CCI_CERT
+          server_endpoint: SE_DEMO_CLUSTER_CCI_URL
+      
+      - run:
+          name: Delete deployment << pipeline.parameters.version >>
+          command: kubectl -neddie delete deployment blueskygreenbuilds-<<pipeline.parameters.version>>
+      - run:
+          name: Capture Contour routes as DAG
+          command: |
+            sleep 2 
+            # let release agent catch deploy, tell contour to shape traffic. 
+            # must be a smarter way
+            vamp/get-dag-as-dot.sh
+            cat contour-dag.dot
+      - store_artifacts:
+          path: contour-dag.png
+      - run: exit 1
+    environment:
+      SE_DEMO_CLUSTER_CCI_CERT: "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUM1ekNDQWMrZ0F3SUJBZ0lCQURBTkJna3Foa2lHOXcwQkFRc0ZBREFWTVJNd0VRWURWUVFERXdwcmRXSmwKY201bGRHVnpNQjRYRFRJeE1UQXlOakUxTlRjd04xb1hEVE14TVRBeU5ERTFOVGN3TjFvd0ZURVRNQkVHQTFVRQpBeE1LYTNWaVpYSnVaWFJsY3pDQ0FTSXdEUVlKS29aSWh2Y05BUUVCQlFBRGdnRVBBRENDQVFvQ2dnRUJBTG5CCkQzckt1OEZoa1dLZE5RZERBRFJ3TjRhMXFUR3lBWHNkTHlXSkdKaUk1SmpSZWVvcVFLWWRRdXRyelVPNms0cjgKMy9rRFVGM1lHcjVCMlZJeUQ2eXdVc2tjL3RSK0FmbHBmSTRPZS9NdGNkdUt4VUtYUU85ZHVTMzdUN2JpeUs3bgozOE9EaWh0aEJxQ0JUL3lyK3hKRGVvNXlyM2ZkbGFvQUljNlhGam9EblUvQ0lac1NyS2VVWHVmU3NkMXJaRUpUCm82aWFnejJRdjFZVTZFcjZob0d3ZnRMa004RENWVlRZMlR1cUE1VlZKY29JK0FoNnRaOXIvcjVnWDBvZHd6QW8KWEN5VlJraWZVK3NrU3JIc1huWlVFK2FhZ0FUdWtPQzdWQVNqNFJySUcySUY3dlphTTJ6SFkzSHU4NWFrWWliSQpUME5MQVR2aDk2Ri9zeEZQYVYwQ0F3RUFBYU5DTUVBd0RnWURWUjBQQVFIL0JBUURBZ0trTUE4R0ExVWRFd0VCCi93UUZNQU1CQWY4d0hRWURWUjBPQkJZRUZLU2tRN2hkcEVlNVNyVFBoM1dpNVV6bTRrZy9NQTBHQ1NxR1NJYjMKRFFFQkN3VUFBNElCQVFBeDF5a3RCQWMxMUlEdUMyaUlXRFFObUttUUw5L1orSlcwM3NYUTBxa042YUplZnBtRQpBeFZTaUJKMUswdEFPMGQxV0c5M2VWOVJlNzZzOXpzSkxadEgwRVdoSTVLVFhublgySlpja1o0SW5LRVBCRHB2Cm1uSzNGQmo2VGVOclY2Q2dzckYyM0ZzRm9MRUdSZTk1OURQbksvajJIMytVdk4xdHI3TUl4V3pISm1wVHF4Ni8KVHhUcS9pd3hKUXFKMXJlME9admxLcEZaTlNheVBsUm9GMXlzVXFuaU9jMlp3TjhDdzNOS2JFT0EwVlIwVFk1ego2Mk9TaUFWU1BueFFBczJnUDVOQTl0bXFnL2RSdTZDNmx2aVNjVk1UTU9UVnV4dTVSK0dFQ0hqcjlNQm1BdjVnCjBQcVV3L0FZQ3dhcGJuQXdyT2o3bldhMTlHS0NxZGlGd1hXegotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg=="
+      CA_CERT: "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUM1ekNDQWMrZ0F3SUJBZ0lCQURBTkJna3Foa2lHOXcwQkFRc0ZBREFWTVJNd0VRWURWUVFERXdwcmRXSmwKY201bGRHVnpNQjRYRFRJeE1UQXlOakUxTlRjd04xb1hEVE14TVRBeU5ERTFOVGN3TjFvd0ZURVRNQkVHQTFVRQpBeE1LYTNWaVpYSnVaWFJsY3pDQ0FTSXdEUVlKS29aSWh2Y05BUUVCQlFBRGdnRVBBRENDQVFvQ2dnRUJBTG5CCkQzckt1OEZoa1dLZE5RZERBRFJ3TjRhMXFUR3lBWHNkTHlXSkdKaUk1SmpSZWVvcVFLWWRRdXRyelVPNms0cjgKMy9rRFVGM1lHcjVCMlZJeUQ2eXdVc2tjL3RSK0FmbHBmSTRPZS9NdGNkdUt4VUtYUU85ZHVTMzdUN2JpeUs3bgozOE9EaWh0aEJxQ0JUL3lyK3hKRGVvNXlyM2ZkbGFvQUljNlhGam9EblUvQ0lac1NyS2VVWHVmU3NkMXJaRUpUCm82aWFnejJRdjFZVTZFcjZob0d3ZnRMa004RENWVlRZMlR1cUE1VlZKY29JK0FoNnRaOXIvcjVnWDBvZHd6QW8KWEN5VlJraWZVK3NrU3JIc1huWlVFK2FhZ0FUdWtPQzdWQVNqNFJySUcySUY3dlphTTJ6SFkzSHU4NWFrWWliSQpUME5MQVR2aDk2Ri9zeEZQYVYwQ0F3RUFBYU5DTUVBd0RnWURWUjBQQVFIL0JBUURBZ0trTUE4R0ExVWRFd0VCCi93UUZNQU1CQWY4d0hRWURWUjBPQkJZRUZLU2tRN2hkcEVlNVNyVFBoM1dpNVV6bTRrZy9NQTBHQ1NxR1NJYjMKRFFFQkN3VUFBNElCQVFBeDF5a3RCQWMxMUlEdUMyaUlXRFFObUttUUw5L1orSlcwM3NYUTBxa042YUplZnBtRQpBeFZTaUJKMUswdEFPMGQxV0c5M2VWOVJlNzZzOXpzSkxadEgwRVdoSTVLVFhublgySlpja1o0SW5LRVBCRHB2Cm1uSzNGQmo2VGVOclY2Q2dzckYyM0ZzRm9MRUdSZTk1OURQbksvajJIMytVdk4xdHI3TUl4V3pISm1wVHF4Ni8KVHhUcS9pd3hKUXFKMXJlME9admxLcEZaTlNheVBsUm9GMXlzVXFuaU9jMlp3TjhDdzNOS2JFT0EwVlIwVFk1ego2Mk9TaUFWU1BueFFBczJnUDVOQTl0bXFnL2RSdTZDNmx2aVNjVk1UTU9UVnV4dTVSK0dFQ0hqcjlNQm1BdjVnCjBQcVV3L0FZQ3dhcGJuQXdyT2o3bldhMTlHS0NxZGlGd1hXegotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg=="
+      SE_DEMO_CLUSTER_CCI_URL: "https://0DF7EA1E2D47EA3057B39C107F4DEADF.gr7.us-east-2.eks.amazonaws.com"
+
+commands:
+    # only here till Ryan fixes the kubectl orb
+    config:
+      parameters:
+        token:
+          type: env_var_name
+          default: TOKEN
+          description: "Service Account token"
+        cert:
+          type: env_var_name
+          default: CA_CERT
+          description: "Cert to be base64 decoded"
+        server_endpoint:
+          type: env_var_name
+          default: SERVER_ENDPOINT
+          description: "Server endpoint for cluster"
+        cluster_name:
+          type: string
+          description: "Name of your cluster"
+        user_name:
+          type: string
+          description: "Name of your SA user"
+          default: circleci
+        namespace:
+          type: string
+          description: "Namespace target"
+        context:
+          type: string
+          description: "Context name"
+          default: cci
+      steps:
+        - run:
+            name: Check for env vars
+            command: |
+                : "${<<parameters.token>>?Token \
+                must be set as Environment variable before running this command.}"
+                : "${<<parameters.cert>>?Cert \
+                must be set as Environment variable before running this command.}"
+                : "${<<parameters.server_endpoint>>?Server Endpoint \
+                must be set as Environment variable before running this command.}"
+                : "${<<parameters.cluster_name>>?Cluster Name \
+                must be set as Environment variable before running this command.}"
+        - run:
+            name: kubectl config
+            environment:
+              PARAM_CLUSTER_NAME: << parameters.cluster_name >>
+              PARAM_USER_NAME: << parameters.user_name >>
+              PARAM_NAMESPACE: << parameters.namespace >>
+              PARAM_CONTEXT: << parameters.context >>
+
+            command: |
+              if [ -n "${PARAM_NAMESPACE}" ]; then
+                set -- "$@" --namespace="${PARAM_NAMESPACE}"
+              fi
+
+              export DECODED_TOKEN=$(echo ${<< parameters.token >>} | base64 -d)
+              echo ${<< parameters.cert >>} | base64 -d > ca.crt
+              kubectl config set-cluster ${PARAM_CLUSTER_NAME} --server=${<< parameters.server_endpoint >>} --certificate-authority=ca.crt
+              kubectl config set-credentials ${PARAM_USER_NAME} --token=${DECODED_TOKEN}
+              kubectl config set-context ${PARAM_CONTEXT} --user=${PARAM_USER_NAME} --cluster=${PARAM_CLUSTER_NAME} "$@"
+              kubectl config use-context ${PARAM_CONTEXT}

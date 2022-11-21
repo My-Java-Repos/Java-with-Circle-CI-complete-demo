@@ -1,0 +1,16 @@
+server.port: ${PORT:8080}
+#dumb but necessary as of soem recent spring versiion...
+spring:
+  profiles.active: @spring.profiles.active@ 
+  application.name: blueskygreenbuilds
+
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, metrics, prometheus, httptrace
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    web.server.request.autotime.percentiles: ".50,.95"
